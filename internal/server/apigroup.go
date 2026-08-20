@@ -125,10 +125,31 @@ func (s *Server) modelStatus() []apiModel {
 		})
 	}
 
+	staticPeerFQNs := make(map[string]struct{})
 	for peerID, peer := range s.cfg.Peers {
 		for _, modelID := range peer.Models {
-			models = append(models, apiModel{Id: config.PeerModelFQN(peerID, modelID), PeerID: peerID})
+			fqn := config.PeerModelFQN(peerID, modelID)
+			staticPeerFQNs[fqn] = struct{}{}
+			models = append(models, apiModel{Id: fqn, PeerID: peerID})
 		}
+	}
+
+	// Discovered models are always FQN-only (see design decision D1); a
+	// statically listed peer model that also happens to be discovered
+	// keeps its static entry above rather than being duplicated.
+	for _, dm := range s.cfg.PeerModels.Models() {
+		fqn := config.PeerModelFQN(dm.PeerID, dm.ModelID)
+		if _, alreadyListed := staticPeerFQNs[fqn]; alreadyListed {
+			continue
+		}
+		_, capsMap, _, ctxLen := renderCapabilities(dm.Capabilities)
+		models = append(models, apiModel{
+			Id:            fqn,
+			Name:          dm.Name,
+			PeerID:        dm.PeerID,
+			Capabilities:  capsMap,
+			ContextLength: ctxLen,
+		})
 	}
 
 	return models
@@ -583,6 +604,7 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 
 	defer event.On(func(e swaputil.ProcessStateChangeEvent) { sendModels() })()
 	defer event.On(func(e swaputil.ConfigFileChangedEvent) { sendModels() })()
+	defer event.On(func(e swaputil.PeerModelsChangedEvent) { sendModels() })()
 	defer event.On(func(e swaputil.ProfileChangedEvent) {
 		sendProfile()
 		sendModels()

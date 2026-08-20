@@ -243,6 +243,37 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Models discovered from peers.<id>.discovery. Unlike the static loop
+	// above, discovered models are always addressable only by their fully
+	// qualified name (design decision D1: bare-name aliasing is exclusive
+	// to statically listed peer.models, since it would otherwise depend on
+	// remote state that changes asynchronously between peers), so there is
+	// no bare name to add to modelIDs here.
+	for _, dm := range s.cfg.PeerModels.Models() {
+		fqn := config.PeerModelFQN(dm.PeerID, dm.ModelID)
+		if _, alreadyListed := modelIDs[fqn]; alreadyListed {
+			// A statically listed model that also happens to be discovered
+			// keeps the static entry above (already validated at load
+			// time); don't emit a duplicate ID.
+			continue
+		}
+		modelIDs[fqn] = struct{}{}
+
+		name := dm.Name
+		if name == "" {
+			name = dm.PeerID + ": " + dm.ModelID
+		}
+		data = append(data, newRecord(
+			fqn,
+			name,
+			"",
+			nil,
+			dm.Capabilities,
+			"unloaded",
+			map[string]any{"type": "peer", "peerID": dm.PeerID},
+		))
+	}
+
 	for selectorID, selector := range s.cfg.Selectors {
 		modelIDs[selectorID] = struct{}{}
 		if selector.Unlisted {

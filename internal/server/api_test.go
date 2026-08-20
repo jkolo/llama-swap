@@ -100,6 +100,139 @@ func TestServer_HandleListModels_PeerNamespaces(t *testing.T) {
 	}
 }
 
+func TestServer_HandleListModels_PeerDiscovered(t *testing.T) {
+	registry := config.NewPeerRegistry()
+	registry.SetPeerModels("openrouter", map[string]config.DiscoveredModel{
+		"z-ai/glm-4.7": {
+			PeerID:  "openrouter",
+			ModelID: "z-ai/glm-4.7",
+			Name:    "GLM 4.7",
+			Capabilities: config.ModelCapConfig{
+				In: []string{"text"}, Out: []string{"text"}, Tools: true, Context: 200000,
+			},
+		},
+	})
+
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s.cfg = config.Config{
+		Peers: config.PeerDictionaryConfig{
+			"openrouter": {Discovery: &config.PeerDiscoveryConfig{Enabled: true}},
+		},
+		PeerModels: registry,
+	}
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+
+	var resp struct {
+		Data []modelRecord `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	var found *modelRecord
+	for i := range resp.Data {
+		if resp.Data[i].ID == "openrouter/z-ai/glm-4.7" {
+			found = &resp.Data[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("discovered model not found in /v1/models response: %+v", resp.Data)
+	}
+	if found.Name != "GLM 4.7" {
+		t.Errorf("expected discovered model's Name to be used, got %q", found.Name)
+	}
+	if found.ContextLength != 200000 {
+		t.Errorf("expected context_length 200000, got %d", found.ContextLength)
+	}
+	if found.Capabilities["function_calling"] != true {
+		t.Errorf("expected function_calling capability, got %v", found.Capabilities)
+	}
+	llamaswapMeta, _ := found.Meta["llamaswap"].(map[string]any)
+	if llamaswapMeta["type"] != "peer" || llamaswapMeta["peerID"] != "openrouter" {
+		t.Errorf("expected meta.llamaswap.{type,peerID} to be preserved, got %v", found.Meta)
+	}
+}
+
+func TestServer_HandleListModels_PeerDiscoveredDoesNotDuplicateStaticEntry(t *testing.T) {
+	registry := config.NewPeerRegistry()
+	registry.SetPeerModels("peer1", map[string]config.DiscoveredModel{
+		"model-a": {PeerID: "peer1", ModelID: "model-a", Name: "should not appear"},
+	})
+
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s.cfg = config.Config{
+		Peers:      config.PeerDictionaryConfig{"peer1": {Models: []string{"model-a"}}},
+		PeerModels: registry,
+	}
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+
+	var resp struct {
+		Data []modelRecord `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	count := 0
+	for _, m := range resp.Data {
+		if m.ID == "peer1/model-a" {
+			count++
+			if m.Name == "should not appear" {
+				t.Error("statically configured entry should not be overwritten by a discovered one")
+			}
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected exactly one record for peer1/model-a, got %d", count)
+	}
+}
+
+func TestServer_ModelStatus_PeerDiscovered(t *testing.T) {
+	registry := config.NewPeerRegistry()
+	registry.SetPeerModels("openrouter", map[string]config.DiscoveredModel{
+		"z-ai/glm-4.7": {
+			PeerID:  "openrouter",
+			ModelID: "z-ai/glm-4.7",
+			Name:    "GLM 4.7",
+			Capabilities: config.ModelCapConfig{
+				In: []string{"text"}, Out: []string{"text"}, Context: 200000,
+			},
+		},
+	})
+
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+	s.cfg = config.Config{
+		Peers: config.PeerDictionaryConfig{
+			"openrouter": {Discovery: &config.PeerDiscoveryConfig{Enabled: true}},
+		},
+		PeerModels: registry,
+	}
+
+	var found *apiModel
+	for _, m := range s.modelStatus() {
+		if m.Id == "openrouter/z-ai/glm-4.7" {
+			mCopy := m
+			found = &mCopy
+		}
+	}
+	if found == nil {
+		t.Fatal("discovered model not found in modelStatus()")
+	}
+	if found.PeerID != "openrouter" {
+		t.Errorf("expected peerID openrouter, got %q", found.PeerID)
+	}
+	if found.Name != "GLM 4.7" {
+		t.Errorf("expected Name to be populated from the discovered model, got %q", found.Name)
+	}
+	if found.ContextLength != 200000 {
+		t.Errorf("expected context_length 200000, got %d", found.ContextLength)
+	}
+}
+
 func TestServer_HandleListModels_Aliases(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
 	s.cfg = config.Config{

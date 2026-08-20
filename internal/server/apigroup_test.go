@@ -13,6 +13,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/cache"
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/hw"
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
@@ -626,5 +627,43 @@ func TestServer_APIEvents_InitialPayload(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("initial SSE payload missing %s; body=%q", want, body)
 		}
+	}
+}
+
+// TestServer_APIEvents_PeerModelsChangedTriggersModelStatus confirms a
+// PeerModelsChangedEvent (emitted by a peer's discovery poller after a
+// refresh, see internal/router/peer.go) makes /api/events push a fresh
+// modelStatus message, not just process state changes and config reloads.
+func TestServer_APIEvents_PeerModelsChangedTriggersModelStatus(t *testing.T) {
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/api/events", nil).WithContext(ctx)
+	w := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		s.ServeHTTP(w, req)
+		close(done)
+	}()
+
+	// Let the handler subscribe and send its initial payload first. The
+	// response recorder is not safe for concurrent read/write, so nothing
+	// reads w.Body until the handler goroutine has fully returned below.
+	time.Sleep(100 * time.Millisecond)
+	event.Emit(swaputil.PeerModelsChangedEvent{PeerID: "openrouter"})
+	time.Sleep(150 * time.Millisecond)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not return after context cancel")
+	}
+
+	// One modelStatus message is always sent on connect; a second one
+	// means the PeerModelsChangedEvent triggered an extra push.
+	if count := strings.Count(w.Body.String(), `"type":"modelStatus"`); count < 2 {
+		t.Fatalf("expected at least 2 modelStatus messages (initial + PeerModelsChangedEvent-triggered), got %d", count)
 	}
 }
