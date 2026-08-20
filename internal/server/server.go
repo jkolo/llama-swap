@@ -194,6 +194,15 @@ type BuildInfo struct {
 }
 
 func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, upstreamlog *logmon.Monitor, perfMon *perf.Monitor, st *store.Store, build BuildInfo, hardware *hw.HardwareSnapshot, refs *docagent.Docs) (*Server, error) {
+	// Checked first, before constructing any router: router.NewPeer may
+	// start background discovery goroutines (see peers.<id>.discovery), and
+	// a router built here with no way to hand it back to the caller for
+	// cleanup would leak them.
+	if st == nil {
+		return nil, fmt.Errorf("store is required")
+	}
+
+
 	var local router.LocalRouter
 	var err error
 
@@ -213,10 +222,6 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 	peer, err := router.NewPeer(cfg, proxylog)
 	if err != nil {
 		return nil, fmt.Errorf("creating peer router: %w", err)
-	}
-
-	if st == nil {
-		return nil, fmt.Errorf("store is required")
 	}
 
 	shutdownCtx, shutdownFn := context.WithCancel(context.Background())

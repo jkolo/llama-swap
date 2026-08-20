@@ -7,12 +7,15 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
+	"github.com/stretchr/testify/require"
 	"github.com/tailscale/tailcat"
 )
 
@@ -30,8 +33,8 @@ func TestNewPeer_EmptyPeers(t *testing.T) {
 	if pr == nil {
 		t.Fatal("expected non-nil Peer")
 	}
-	if len(pr.peers) != 0 {
-		t.Fatalf("expected empty peers map, got %d entries", len(pr.peers))
+	if len(pr.currentRoutes()) != 0 {
+		t.Fatalf("expected empty peers map, got %d entries", len(pr.currentRoutes()))
 	}
 }
 
@@ -50,22 +53,22 @@ func TestNewPeer_SinglePeer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pr.peers) != 4 {
-		t.Fatalf("expected 4 entries, got %d", len(pr.peers))
+	if len(pr.currentRoutes()) != 4 {
+		t.Fatalf("expected 4 entries, got %d", len(pr.currentRoutes()))
 	}
-	if _, ok := pr.peers["model-a"]; !ok {
+	if _, ok := pr.currentRoutes()["model-a"]; !ok {
 		t.Error("expected model-a to be mapped")
 	}
-	if _, ok := pr.peers["model-b"]; !ok {
+	if _, ok := pr.currentRoutes()["model-b"]; !ok {
 		t.Error("expected model-b to be mapped")
 	}
-	if _, ok := pr.peers["peer1/model-a"]; !ok {
+	if _, ok := pr.currentRoutes()["peer1/model-a"]; !ok {
 		t.Error("expected peer1/model-a to be mapped")
 	}
-	if _, ok := pr.peers["peer1/model-b"]; !ok {
+	if _, ok := pr.currentRoutes()["peer1/model-b"]; !ok {
 		t.Error("expected peer1/model-b to be mapped")
 	}
-	if _, ok := pr.peers["model-c"]; ok {
+	if _, ok := pr.currentRoutes()["model-c"]; ok {
 		t.Error("expected model-c to not be mapped")
 	}
 }
@@ -90,16 +93,16 @@ func TestNewPeer_MultiplePeers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pr.peers) != 8 {
-		t.Fatalf("expected 8 entries, got %d", len(pr.peers))
+	if len(pr.currentRoutes()) != 8 {
+		t.Fatalf("expected 8 entries, got %d", len(pr.currentRoutes()))
 	}
 	for _, m := range []string{"model-a", "model-b", "model-c", "model-d"} {
-		if _, ok := pr.peers[m]; !ok {
+		if _, ok := pr.currentRoutes()[m]; !ok {
 			t.Errorf("expected %s to be mapped", m)
 		}
 	}
 	for _, m := range []string{"peer1/model-a", "peer1/model-b", "peer2/model-c", "peer2/model-d"} {
-		if _, ok := pr.peers[m]; !ok {
+		if _, ok := pr.currentRoutes()[m]; !ok {
 			t.Errorf("expected %s to be mapped", m)
 		}
 	}
@@ -124,8 +127,14 @@ func TestNewPeer_MembersIncludePeersWithoutModels(t *testing.T) {
 	if len(pr.members) != 2 {
 		t.Fatalf("expected 2 members, got %d", len(pr.members))
 	}
-	if pr.members[0].peerID != "empty-peer" || pr.members[1].peerID != "modeled-peer" {
-		t.Fatalf("members = [%s, %s], want sorted peer order", pr.members[0].peerID, pr.members[1].peerID)
+	for _, peerID := range []string{"empty-peer", "modeled-peer"} {
+		member, ok := pr.members[peerID]
+		if !ok {
+			t.Fatalf("peer %s has no member", peerID)
+		}
+		if member.peerID != peerID {
+			t.Fatalf("members[%s].peerID = %s", peerID, member.peerID)
+		}
 	}
 }
 
@@ -149,16 +158,16 @@ func TestNewPeer_DuplicateModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pr.peers) != 2 {
-		t.Fatalf("expected 2 qualified entries for duplicate model, got %d", len(pr.peers))
+	if len(pr.currentRoutes()) != 2 {
+		t.Fatalf("expected 2 qualified entries for duplicate model, got %d", len(pr.currentRoutes()))
 	}
-	if _, ok := pr.peers["duplicate-model"]; ok {
+	if _, ok := pr.currentRoutes()["duplicate-model"]; ok {
 		t.Error("duplicate bare model should not be mapped")
 	}
-	if _, ok := pr.peers["alpha-peer/duplicate-model"]; !ok {
+	if _, ok := pr.currentRoutes()["alpha-peer/duplicate-model"]; !ok {
 		t.Error("expected alpha-peer/duplicate-model to be mapped")
 	}
-	if _, ok := pr.peers["beta-peer/duplicate-model"]; !ok {
+	if _, ok := pr.currentRoutes()["beta-peer/duplicate-model"]; !ok {
 		t.Error("expected beta-peer/duplicate-model to be mapped")
 	}
 }
@@ -179,10 +188,10 @@ func TestNewPeer_FQNPrecedesCollidingBareModel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := pr.peers["p1/model"]; got == nil || got.member.peerID != "p1" || got.modelID != "model" {
+	if got := pr.currentRoutes()["p1/model"]; got == nil || got.member.peerID != "p1" || got.modelID != "model" {
 		t.Fatalf("p1/model route = %#v, want p1 model", got)
 	}
-	if got := pr.peers["p2/p1/model"]; got == nil || got.member.peerID != "p2" || got.modelID != "p1/model" {
+	if got := pr.currentRoutes()["p2/p1/model"]; got == nil || got.member.peerID != "p2" || got.modelID != "p1/model" {
 		t.Fatalf("p2/p1/model route = %#v, want p2 p1/model", got)
 	}
 }
@@ -717,7 +726,7 @@ func TestNewPeer_CustomTimeouts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	member, ok := pr.peers["model1"]
+	member, ok := pr.currentRoutes()["model1"]
 	if !ok {
 		t.Fatal("expected model1 to be mapped")
 	}
@@ -762,7 +771,7 @@ peers:
 	if err != nil {
 		t.Fatal(err)
 	}
-	member := pr.peers["cat/remote"].member
+	member := pr.currentRoutes()["cat/remote"].member
 	if member.tailcat == nil {
 		t.Fatal("Tailcat client was not attached")
 	}
@@ -774,5 +783,306 @@ peers:
 	}
 	if err := pr.Shutdown(time.Second); err != nil {
 		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+func TestNewPeer_DiscoveryPopulatesRoutesEndToEnd(t *testing.T) {
+	var upstreamModel string
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			w.Write([]byte(`{"object":"list","data":[{"id":"discovered-model"}]}`))
+			return
+		}
+		data, _ := swaputil.ExtractModel(r)
+		upstreamModel = data
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer testServer.Close()
+
+	proxyURL, _ := url.Parse(testServer.URL)
+	discovery := config.DefaultPeerDiscoveryConfig()
+	discovery.RefreshInterval = 0 // fetch once, no ticker
+
+	pr, err := NewPeer(config.Config{
+		PeerModels: config.NewPeerRegistry(),
+		Peers: config.PeerDictionaryConfig{
+			"peer1": {
+				Proxy:     testServer.URL,
+				ProxyURL:  proxyURL,
+				Discovery: &discovery,
+			},
+		},
+	}, testLogger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Shutdown(0)
+
+	require.Eventually(t, func() bool {
+		return pr.Handles("peer1/discovered-model")
+	}, time.Second, 5*time.Millisecond, "discovered model should become routable")
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		strings.NewReader(`{"model":"peer1/discovered-model","prompt":"hello"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	pr.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	if upstreamModel != "discovered-model" {
+		t.Fatalf("upstream model = %q, want discovered-model (unqualified)", upstreamModel)
+	}
+}
+
+func TestNewPeer_DiscoveryDoesNotCreateBareName(t *testing.T) {
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"object":"list","data":[{"id":"only-one-provider"}]}`))
+	}))
+	defer testServer.Close()
+
+	proxyURL, _ := url.Parse(testServer.URL)
+	discovery := config.DefaultPeerDiscoveryConfig()
+	discovery.RefreshInterval = 0
+
+	pr, err := NewPeer(config.Config{
+		PeerModels: config.NewPeerRegistry(),
+		Peers: config.PeerDictionaryConfig{
+			"peer1": {
+				Proxy:     testServer.URL,
+				ProxyURL:  proxyURL,
+				Discovery: &discovery,
+			},
+		},
+	}, testLogger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Shutdown(0)
+
+	require.Eventually(t, func() bool {
+		return pr.Handles("peer1/only-one-provider")
+	}, time.Second, 5*time.Millisecond, "discovered model should become routable via FQN")
+
+	// Per design decision D1, a discovered model - even one served by
+	// exactly one peer - must never be reachable by its bare name, unlike
+	// statically configured peer.models.
+	if pr.Handles("only-one-provider") {
+		t.Fatal("discovered model must not be reachable by a bare name")
+	}
+}
+
+func TestNewPeer_DiscoverySkipsReservedName(t *testing.T) {
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"object":"list","data":[{"id":"local-model"}]}`))
+	}))
+	defer testServer.Close()
+
+	proxyURL, _ := url.Parse(testServer.URL)
+	discovery := config.DefaultPeerDiscoveryConfig()
+	discovery.RefreshInterval = 0
+
+	cfg := config.Config{
+		PeerModels: config.NewPeerRegistry(),
+		Models:     map[string]config.ModelConfig{"local-model": {}},
+		Peers: config.PeerDictionaryConfig{
+			"local-model": { // peer ID intentionally matches a local model ID
+				Proxy:     testServer.URL,
+				ProxyURL:  proxyURL,
+				Discovery: &discovery,
+			},
+		},
+	}
+
+	pr, err := NewPeer(cfg, testLogger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Shutdown(0)
+
+	// "local-model/local-model" doesn't conflict with anything, so give the
+	// poller a moment and confirm nothing panics and nothing unexpected
+	// gets registered under the reserved bare name "local-model".
+	time.Sleep(50 * time.Millisecond)
+	if pr.Handles("local-model") {
+		t.Fatal("discovered routes must never claim a name reserved by a local model")
+	}
+}
+
+func TestPeer_ServeHTTP_DiscoveredModelUsesPeerApiKey(t *testing.T) {
+	var gotAuth string
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			w.Write([]byte(`{"object":"list","data":[{"id":"discovered-model"}]}`))
+			return
+		}
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer testServer.Close()
+
+	proxyURL, _ := url.Parse(testServer.URL)
+	discovery := config.DefaultPeerDiscoveryConfig()
+	discovery.RefreshInterval = 0
+
+	pr, err := NewPeer(config.Config{
+		PeerModels: config.NewPeerRegistry(),
+		Peers: config.PeerDictionaryConfig{
+			"peer1": {
+				Proxy:     testServer.URL,
+				ProxyURL:  proxyURL,
+				ApiKey:    "sk-peer-key",
+				Discovery: &discovery,
+			},
+		},
+	}, testLogger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Shutdown(0)
+
+	require.Eventually(t, func() bool {
+		return pr.Handles("peer1/discovered-model")
+	}, time.Second, 5*time.Millisecond)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	*req = *req.WithContext(swaputil.SetContext(req.Context(), swaputil.ReqContextData{
+		Model: "peer1/discovered-model", ModelID: "peer1/discovered-model",
+	}))
+	w := httptest.NewRecorder()
+	pr.ServeHTTP(w, req)
+
+	if gotAuth != "Bearer sk-peer-key" {
+		t.Fatalf("expected peer's own apiKey to be injected for a discovered model, got %q", gotAuth)
+	}
+}
+
+func TestNewPeer_DiscoveryFailureKeepsPreviousModels(t *testing.T) {
+	var succeed atomic.Bool
+	succeed.Store(true)
+
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !succeed.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Write([]byte(`{"object":"list","data":[{"id":"stable-model"}]}`))
+	}))
+	defer testServer.Close()
+
+	proxyURL, _ := url.Parse(testServer.URL)
+	discovery := config.DefaultPeerDiscoveryConfig()
+	discovery.RefreshInterval = 1 // seconds - fast enough to observe a second cycle in tests
+
+	pr, err := NewPeer(config.Config{
+		PeerModels: config.NewPeerRegistry(),
+		Peers: config.PeerDictionaryConfig{
+			"peer1": {
+				Proxy:     testServer.URL,
+				ProxyURL:  proxyURL,
+				Discovery: &discovery,
+			},
+		},
+	}, testLogger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Shutdown(0)
+
+	require.Eventually(t, func() bool {
+		return pr.Handles("peer1/stable-model")
+	}, time.Second, 5*time.Millisecond, "first fetch should succeed")
+
+	succeed.Store(false)
+	// Give at least one more refresh cycle a chance to run and fail.
+	time.Sleep(1500 * time.Millisecond)
+
+	if !pr.Handles("peer1/stable-model") {
+		t.Fatal("a failed refresh must not remove previously discovered models")
+	}
+}
+
+func TestNewPeer_DiscoveryEmitsPeerModelsChangedEvent(t *testing.T) {
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"object":"list","data":[{"id":"m"}]}`))
+	}))
+	defer testServer.Close()
+
+	var gotPeerID atomic.Value
+	unsubscribe := event.On(func(e swaputil.PeerModelsChangedEvent) {
+		gotPeerID.Store(e.PeerID)
+	})
+	defer unsubscribe()
+
+	proxyURL, _ := url.Parse(testServer.URL)
+	discovery := config.DefaultPeerDiscoveryConfig()
+	discovery.RefreshInterval = 0
+
+	pr, err := NewPeer(config.Config{
+		PeerModels: config.NewPeerRegistry(),
+		Peers: config.PeerDictionaryConfig{
+			"peer1": {
+				Proxy:     testServer.URL,
+				ProxyURL:  proxyURL,
+				Discovery: &discovery,
+			},
+		},
+	}, testLogger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Shutdown(0)
+
+	require.Eventually(t, func() bool {
+		v, ok := gotPeerID.Load().(string)
+		return ok && v == "peer1"
+	}, time.Second, 5*time.Millisecond, "expected a PeerModelsChangedEvent for peer1")
+}
+
+func TestPeer_Shutdown_StopsDiscoveryPolling(t *testing.T) {
+	var requestCount atomic.Int64
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.Write([]byte(`{"object":"list","data":[{"id":"m"}]}`))
+	}))
+	defer testServer.Close()
+
+	proxyURL, _ := url.Parse(testServer.URL)
+	discovery := config.DefaultPeerDiscoveryConfig()
+	discovery.RefreshInterval = 1 // seconds
+
+	pr, err := NewPeer(config.Config{
+		PeerModels: config.NewPeerRegistry(),
+		Peers: config.PeerDictionaryConfig{
+			"peer1": {
+				Proxy:     testServer.URL,
+				ProxyURL:  proxyURL,
+				Discovery: &discovery,
+			},
+		},
+	}, testLogger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	require.Eventually(t, func() bool {
+		return requestCount.Load() >= 1
+	}, time.Second, 5*time.Millisecond)
+
+	// Shutdown with a generous timeout and no in-flight requests: per D4.1,
+	// discoveryCtx must be cancelled unconditionally and immediately, not
+	// only on the timeout path (unlike shutdownCtx).
+	if err := pr.Shutdown(5 * time.Second); err != nil {
+		t.Fatalf("unexpected shutdown error: %v", err)
+	}
+
+	countAtShutdown := requestCount.Load()
+	time.Sleep(1500 * time.Millisecond) // longer than the 1s refresh interval
+	if got := requestCount.Load(); got != countAtShutdown {
+		t.Fatalf("discovery kept polling after Shutdown: %d requests before, %d after", countAtShutdown, got)
 	}
 }

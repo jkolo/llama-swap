@@ -8,6 +8,7 @@ const ActivityLogEventID = 0x05
 const ModelPreloadedEventID = 0x06
 const InFlightRequestsEventID = 0x07
 const ProfileChangedEventID = 0x08
+const PeerModelsChangedEventID = 0x09
 
 // ProcessStateChangeEvent is emitted whenever a process transitions between
 // lifecycle states. States are carried as strings so this package stays a leaf
@@ -77,4 +78,15 @@ type ProfileChangedEvent struct {
 
 func (e ProfileChangedEvent) Type() uint32 {
 	return ProfileChangedEventID
+}
+
+// PeerModelsChangedEvent is emitted whenever a peer's discovered model set
+// changes (see peers.<id>.discovery), so /api/events subscribers refresh
+// their model listing without waiting for an unrelated process state change.
+type PeerModelsChangedEvent struct {
+	PeerID string
+}
+
+func (e PeerModelsChangedEvent) Type() uint32 {
+	return PeerModelsChangedEventID
 }
