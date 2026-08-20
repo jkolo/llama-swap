@@ -301,6 +301,13 @@ groups:
 		},
 	}
 
+	// PeerModels is an opaque, always-freshly-allocated runtime registry
+	// (see LoadConfigFromReader), not configuration data - comparing it
+	// structurally would compare unrelated memory addresses. Confirm it was
+	// allocated, then exclude it from the full-struct comparison below.
+	assert.NotNil(t, config.PeerModels)
+	expected.PeerModels = config.PeerModels
+
 	assert.Equal(t, expected, config)
 
 	realname, found := config.RealModelName("m1")

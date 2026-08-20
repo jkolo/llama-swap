@@ -107,6 +107,11 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		return Config{}, fmt.Errorf("logToStdout must be one of: proxy, upstream, both, none")
 	}
 
+	// Every load starts with an empty peer model discovery registry; peer
+	// discovery goroutines populate it after the config (and server) have
+	// finished loading.
+	config.PeerModels = NewPeerRegistry()
+
 	// Populate the aliases map
 	config.aliases = make(map[string]string)
 	for modelName, modelConfig := range config.Models {

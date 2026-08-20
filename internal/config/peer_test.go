@@ -74,6 +74,54 @@ models: []
 `,
 			wantErr: "peer models can not be empty",
 		},
+		{
+			name: "missing models but discovery enabled",
+			yaml: `
+proxy: http://localhost:8080
+discovery:
+  enabled: true
+`,
+			wantErr: "",
+		},
+		{
+			name: "missing models with discovery block present, no enabled key (defaults to enabled)",
+			yaml: `
+proxy: http://localhost:8080
+discovery: {}
+`,
+			wantErr: "",
+		},
+		{
+			name: "missing models with discovery explicitly disabled still errors",
+			yaml: `
+proxy: http://localhost:8080
+discovery:
+  enabled: false
+`,
+			wantErr: "peer models can not be empty",
+		},
+		{
+			name: "discovery with negative refreshInterval",
+			yaml: `
+proxy: http://localhost:8080
+discovery:
+  refreshInterval: -1
+models:
+  - model_a
+`,
+			wantErr: "discovery.refreshInterval",
+		},
+		{
+			name: "discovery with empty path",
+			yaml: `
+proxy: http://localhost:8080
+discovery:
+  path: ""
+models:
+  - model_a
+`,
+			wantErr: "discovery.path",
+		},
 	}
 
 	for _, tt := range tests {
@@ -93,6 +141,100 @@ models: []
 				}
 			}
 		})
+	}
+}
+
+func TestPeerConfig_DiscoveryDefaults(t *testing.T) {
+	var cfg PeerConfig
+	err := yaml.Unmarshal([]byte(`
+proxy: https://openrouter.ai/api
+discovery: {}
+`), &cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Discovery == nil {
+		t.Fatal("expected Discovery to be non-nil when the block is present")
+	}
+	if !cfg.Discovery.Enabled {
+		t.Error("expected Enabled to default to true when the block is present")
+	}
+	if cfg.Discovery.Path != "/v1/models" {
+		t.Errorf("expected default path /v1/models, got %q", cfg.Discovery.Path)
+	}
+	if cfg.Discovery.RefreshInterval != 300 {
+		t.Errorf("expected default refreshInterval 300, got %d", cfg.Discovery.RefreshInterval)
+	}
+	if !cfg.Discovery.Capabilities {
+		t.Error("expected Capabilities to default to true")
+	}
+	if len(cfg.Discovery.Include) != 0 || len(cfg.Discovery.Exclude) != 0 {
+		t.Error("expected empty include/exclude by default")
+	}
+}
+
+func TestPeerConfig_DiscoveryAbsentWhenBlockOmitted(t *testing.T) {
+	var cfg PeerConfig
+	err := yaml.Unmarshal([]byte(`
+proxy: https://openrouter.ai/api
+models:
+  - model_a
+`), &cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Discovery != nil {
+		t.Fatal("expected Discovery to be nil when the block is omitted")
+	}
+}
+
+func TestPeerConfig_DiscoveryCompilesGlobs(t *testing.T) {
+	var cfg PeerConfig
+	err := yaml.Unmarshal([]byte(`
+proxy: https://openrouter.ai/api
+discovery:
+  include:
+    - "openai/*"
+  exclude:
+    - "*:free"
+`), &cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Discovery.IncludeRe) != 1 || !cfg.Discovery.IncludeRe[0].MatchString("openai/gpt-4o") {
+		t.Error("expected include glob to compile and match")
+	}
+	if len(cfg.Discovery.ExcludeRe) != 1 || !cfg.Discovery.ExcludeRe[0].MatchString("z-ai/glm-4.7:free") {
+		t.Error("expected exclude glob to compile and match")
+	}
+}
+
+func TestPeerConfig_DiscoveryExplicitOverrides(t *testing.T) {
+	var cfg PeerConfig
+	err := yaml.Unmarshal([]byte(`
+proxy: https://openrouter.ai/api
+discovery:
+  enabled: false
+  path: /openai/v1/models
+  refreshInterval: 60
+  capabilities: false
+models:
+  - model_a
+`), &cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Discovery.Enabled {
+		t.Error("expected Enabled to be false when explicitly set")
+	}
+	if cfg.Discovery.Path != "/openai/v1/models" {
+		t.Errorf("expected explicit path, got %q", cfg.Discovery.Path)
+	}
+	if cfg.Discovery.RefreshInterval != 60 {
+		t.Errorf("expected explicit refreshInterval 60, got %d", cfg.Discovery.RefreshInterval)
+	}
+	if cfg.Discovery.Capabilities {
+		t.Error("expected Capabilities to be false when explicitly set")
 	}
 }
 
@@ -253,6 +395,70 @@ func TestConfig_ResolvePeerModel(t *testing.T) {
 	}
 }
 
+func TestConfig_ResolvePeerModel_DiscoveredFQN(t *testing.T) {
+	registry := NewPeerRegistry()
+	registry.SetPeerModels("openrouter", map[string]DiscoveredModel{
+		"z-ai/glm-4.7": {PeerID: "openrouter", ModelID: "z-ai/glm-4.7"},
+	})
+	cfg := Config{PeerModels: registry}
+
+	peerID, modelID, found := cfg.ResolvePeerModel("openrouter/z-ai/glm-4.7")
+	if !found || peerID != "openrouter" || modelID != "z-ai/glm-4.7" {
+		t.Fatalf("ResolvePeerModel(discovered FQN) = (%q, %q, %v), want match", peerID, modelID, found)
+	}
+}
+
+func TestConfig_ResolvePeerModel_DiscoveredModelsAreFQNOnly(t *testing.T) {
+	// Per design decision D1: discovered models never get a "bare" alias,
+	// even when only one peer has discovered a model under that ID. Bare
+	// aliasing remains exclusive to statically configured peer.models,
+	// because a bare alias to a discovered model would depend on remote
+	// state that can change asynchronously between two peers' independent
+	// refresh cycles.
+	registry := NewPeerRegistry()
+	registry.SetPeerModels("openrouter", map[string]DiscoveredModel{
+		"unique-model": {PeerID: "openrouter", ModelID: "unique-model"},
+	})
+	cfg := Config{PeerModels: registry}
+
+	_, _, found := cfg.ResolvePeerModel("unique-model")
+	if found {
+		t.Fatal("expected a bare name to NOT resolve to a discovered-only model")
+	}
+
+	// The FQN form still works.
+	peerID, modelID, found := cfg.ResolvePeerModel("openrouter/unique-model")
+	if !found || peerID != "openrouter" || modelID != "unique-model" {
+		t.Fatalf("ResolvePeerModel(FQN) = (%q, %q, %v), want match", peerID, modelID, found)
+	}
+}
+
+func TestConfig_ResolvePeerModel_StaticWinsOverDiscoveredOnFQNCollision(t *testing.T) {
+	registry := NewPeerRegistry()
+	registry.SetPeerModels("openrouter", map[string]DiscoveredModel{
+		"model-a": {PeerID: "openrouter", ModelID: "model-a", Name: "stale discovered copy"},
+	})
+	cfg := Config{
+		Peers:      PeerDictionaryConfig{"openrouter": {Models: []string{"model-a"}}},
+		PeerModels: registry,
+	}
+
+	peerID, modelID, found := cfg.ResolvePeerModel("openrouter/model-a")
+	if !found || peerID != "openrouter" || modelID != "model-a" {
+		t.Fatalf("ResolvePeerModel = (%q, %q, %v), want the statically configured entry", peerID, modelID, found)
+	}
+}
+
+func TestConfig_ResolvePeerModel_NilRegistrySafe(t *testing.T) {
+	cfg := Config{Peers: PeerDictionaryConfig{"p1": {Models: []string{"model"}}}}
+	// PeerModels is nil (the zero value config.Config{} literal used
+	// throughout the test suite) - must not panic.
+	_, _, found := cfg.ResolvePeerModel("p1/nonexistent")
+	if found {
+		t.Fatal("expected no match")
+	}
+}
+
 func TestConfig_ResolvePeerModel_FQNPrecedesBareName(t *testing.T) {
 	cfg := Config{Peers: PeerDictionaryConfig{
 		"p1": {Models: []string{"model"}},
@@ -267,6 +473,50 @@ func TestConfig_ResolvePeerModel_FQNPrecedesBareName(t *testing.T) {
 	peerID, modelID, found = cfg.ResolvePeerModel("p2/p1/model")
 	if !found || peerID != "p2" || modelID != "p1/model" {
 		t.Fatalf("ResolvePeerModel(p2/p1/model) = (%q, %q, %v), want p2 raw slash model", peerID, modelID, found)
+	}
+}
+
+func TestConfig_ReservedModelNames(t *testing.T) {
+	cfg := Config{
+		Models: map[string]ModelConfig{
+			"local-a": {Aliases: []string{"alias-a"}},
+			"local-b": {},
+		},
+		Selectors: map[string]SelectorConfig{
+			"any-chat": {},
+		},
+		Profiles: map[string]ProfileConfig{
+			"work":   {Pins: map[string]string{"work-pin": "local-a"}},
+			"gaming": {Pins: map[string]string{"gaming-pin": "local-b"}},
+		},
+	}
+	cfg.aliases = map[string]string{"alias-a": "local-a"}
+
+	reserved := ReservedModelNames(cfg)
+
+	for _, name := range []string{"local-a", "local-b", "alias-a", "any-chat", "work-pin", "gaming-pin"} {
+		if _, ok := reserved[name]; !ok {
+			t.Errorf("expected %q to be reserved", name)
+		}
+	}
+
+	// Reasons should be descriptive enough to explain the conflict in an
+	// error message.
+	if !strings.Contains(reserved["local-a"], "model ID") {
+		t.Errorf("expected reason for local-a to mention model ID, got %q", reserved["local-a"])
+	}
+	if !strings.Contains(reserved["alias-a"], "alias") {
+		t.Errorf("expected reason for alias-a to mention alias, got %q", reserved["alias-a"])
+	}
+	if !strings.Contains(reserved["any-chat"], "selector") {
+		t.Errorf("expected reason for any-chat to mention selector, got %q", reserved["any-chat"])
+	}
+	if !strings.Contains(reserved["work-pin"], "profile") {
+		t.Errorf("expected reason for work-pin to mention profile, got %q", reserved["work-pin"])
+	}
+
+	if _, ok := reserved["not-reserved"]; ok {
+		t.Error("expected unrelated name to not be reserved")
 	}
 }
 
@@ -324,6 +574,23 @@ func TestConfig_ValidatePeerNamespace(t *testing.T) {
 				t.Fatal("expected reserved peer FQN conflict")
 			}
 		})
+	}
+}
+
+func TestConfig_LoadConfigFromReader_AllocatesPeerModelsRegistry(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(`
+models:
+  local:
+    cmd: echo ${PORT}
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.PeerModels == nil {
+		t.Fatal("expected LoadConfigFromReader to always allocate a non-nil PeerModels registry")
+	}
+	if got := cfg.PeerModels.Models(); len(got) != 0 {
+		t.Fatalf("expected an empty registry on load, got %d entries", len(got))
 	}
 }
 

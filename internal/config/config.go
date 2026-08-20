@@ -203,6 +203,12 @@ type Config struct {
 	// support remote peers, see issue #433, #296
 	Peers PeerDictionaryConfig `yaml:"peers"`
 
+	// PeerModels holds models discovered at runtime from peers configured
+	// with peers.<id>.discovery. Always non-nil after LoadConfigFromReader;
+	// nil-safe on a bare Config{} literal such as those used throughout the
+	// test suite.
+	PeerModels *PeerRegistry `yaml:"-"`
+
 	// upstream controls behaviour of the /upstream passthrough endpoint
 	Upstream UpstreamConfig `yaml:"upstream"`
 
