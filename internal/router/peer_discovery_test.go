@@ -82,6 +82,50 @@ func TestFetchDiscoveredModels_MistralCapabilitiesObject(t *testing.T) {
 	assert.True(t, dm.Capabilities.Tools)
 }
 
+// TestFetchDiscoveredModels_LiteLLMMaxInputTokensMapsToContext reproduces a
+// real LiteLLM proxy /v1/models response, captured live: strictly
+// OpenAI-shaped (id/object/created/owned_by) plus max_input_tokens and
+// max_output_tokens - no "context_length", no "architecture", no
+// "capabilities" object. Before this fix, max_input_tokens was silently
+// ignored and every discovered model from this (very common) proxy shape
+// ended up with an empty ModelCapConfig even though real context-length
+// data was right there in the response.
+func TestFetchDiscoveredModels_LiteLLMMaxInputTokensMapsToContext(t *testing.T) {
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data":[
+			{"id":"claude-sonnet-4-6","object":"model","created":1677610602,"owned_by":"openai",
+			 "max_input_tokens":1000000,"max_output_tokens":64000}
+		]}`))
+	}))
+	defer testServer.Close()
+
+	discovery := defaultDiscoveryConfig(t)
+	models, err := FetchDiscoveredModels(context.Background(), testServer.Client(), "cloud", testServer.URL, discovery, "")
+	require.NoError(t, err)
+	require.Contains(t, models, "claude-sonnet-4-6")
+
+	dm := models["claude-sonnet-4-6"]
+	assert.Equal(t, 1000000, dm.Capabilities.Context)
+}
+
+// TestFetchDiscoveredModels_ContextLengthPreferredOverMaxInputTokens keeps
+// the existing OpenRouter-style "context_length" field authoritative when a
+// response happens to carry both - max_input_tokens is a fallback for
+// providers (LiteLLM, Anthropic) that never send context_length at all.
+func TestFetchDiscoveredModels_ContextLengthPreferredOverMaxInputTokens(t *testing.T) {
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data":[
+			{"id":"m","context_length":200000,"max_input_tokens":1000000}
+		]}`))
+	}))
+	defer testServer.Close()
+
+	discovery := defaultDiscoveryConfig(t)
+	models, err := FetchDiscoveredModels(context.Background(), testServer.Client(), "peer1", testServer.URL, discovery, "")
+	require.NoError(t, err)
+	assert.Equal(t, 200000, models["m"].Capabilities.Context)
+}
+
 func TestFetchDiscoveredModels_InjectsAuthHeaders(t *testing.T) {
 	var gotAuth, gotAPIKey string
 	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

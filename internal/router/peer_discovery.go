@@ -24,8 +24,9 @@ const maxDiscoveryResponseBytes = 10 << 20 // 10 MiB
 var validDiscoveryModalities = map[string]bool{"text": true, "audio": true, "image": true}
 
 // discoveryModel is the union of /v1/models item fields this parser
-// understands across OpenAI, OpenRouter, and Mistral-shaped responses. Any
-// field a given peer doesn't send simply decodes to its zero value.
+// understands across OpenAI, OpenRouter, Mistral, and LiteLLM-shaped
+// responses. Any field a given peer doesn't send simply decodes to its zero
+// value.
 type discoveryModel struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
@@ -52,6 +53,15 @@ type discoveryModel struct {
 
 	SupportedParameters []string `json:"supported_parameters"`
 	ContextLength       int      `json:"context_length"`
+
+	// MaxInputTokens is LiteLLM's (and Anthropic's) name for what
+	// OpenRouter calls context_length. Many LiteLLM proxy deployments
+	// enrich their otherwise plain OpenAI-shaped /v1/models with this
+	// field but never send context_length, architecture, or a
+	// capabilities object - confirmed against a live proxy, where the
+	// full item shape was just
+	// {"id","object","created","owned_by","max_input_tokens","max_output_tokens"}.
+	MaxInputTokens int `json:"max_input_tokens"`
 
 	Meta *struct {
 		NCtx int `json:"n_ctx"`
@@ -210,10 +220,13 @@ func mapDiscoveryCapabilities(item discoveryModel) config.ModelCapConfig {
 		caps.Reranker = true
 	}
 
-	if item.ContextLength > 0 {
+	switch {
+	case item.ContextLength > 0:
 		caps.Context = item.ContextLength
-	} else if item.Meta != nil && item.Meta.NCtx > 0 {
+	case item.Meta != nil && item.Meta.NCtx > 0:
 		caps.Context = item.Meta.NCtx
+	case item.MaxInputTokens > 0:
+		caps.Context = item.MaxInputTokens
 	}
 
 	return caps
