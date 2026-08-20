@@ -709,8 +709,7 @@
             "additionalProperties": {
                 "type": "object",
                 "required": [
-                    "proxy",
-                    "models"
+                    "proxy"
                 ],
                 "properties": {
                     "proxy": {
@@ -734,7 +733,51 @@
                             "type": "string",
                             "minLength": 1
                         },
-                        "description": "A list of models served by the peer."
+                        "description": "A list of models served by the peer. Required unless discovery is configured and enabled."
+                    },
+                    "discovery": {
+                        "type": "object",
+                        "properties": {
+                            "enabled": {
+                                "type": "boolean",
+                                "default": true,
+                                "description": "Turn discovery on or off. Defaults to true whenever the discovery block is present at all."
+                            },
+                            "path": {
+                                "type": "string",
+                                "default": "/v1/models",
+                                "description": "Appended to 'proxy' to form the discovery request URL, e.g. '/openai/v1/models' for Groq or '/v1beta/openai/models' for Gemini's OpenAI-compatible layer."
+                            },
+                            "refreshInterval": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "default": 300,
+                                "description": "How often, in seconds, to re-fetch the model list after startup. 0 means only fetch at startup and on config reload."
+                            },
+                            "capabilities": {
+                                "type": "boolean",
+                                "default": true,
+                                "description": "Import capability/modality/context-length info from the peer's response into this model's /v1/models entry."
+                            },
+                            "include": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "default": [],
+                                "description": "Glob patterns applied to discovered model IDs ('*' matches '/' too). Empty means include everything."
+                            },
+                            "exclude": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "default": [],
+                                "description": "Glob patterns applied to discovered model IDs ('*' matches '/' too). Always wins over include."
+                            }
+                        },
+                        "additionalProperties": false,
+                        "description": "Automatically fetch this peer's model list from its own OpenAI-compatible /v1/models endpoint instead of (or in addition to) listing every model under 'models' by hand."
                     },
                     "filters": {
                         "type": "object",

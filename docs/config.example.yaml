@@ -703,7 +703,9 @@ routing:
 # - peers can be another llama-swap
 # - peers can be any server that provides the /v1/ generative api endpoints supported by llama-swap
 # - peer models are always addressable as <peer ID>/<model ID>
-# - an unqualified model ID is accepted only when exactly one peer provides it
+# - an unqualified model ID is accepted only when exactly one peer provides it, and only when
+#   the model came from `models:` below - discovered models (see `discovery:`) are always
+#   addressable only by their fully qualified <peer ID>/<model ID> name
 # - local model IDs and aliases take precedence over unqualified peer model IDs
 # - fully qualified peer names are reserved and are the peer IDs shown by /v1/models
 peers:
@@ -714,7 +716,7 @@ peers:
     # - requested path to llama-swap will be appended to the end of the proxy value
     proxy: http://192.168.1.23
     # models: a list of models served by the peer
-    # - required
+    # - required, unless discovery is configured and enabled (see openrouter example below)
     models:
       - model_a
       - model_b
@@ -735,13 +737,52 @@ peers:
     # - key will be injected into headers: Authorization: Bearer <key> and x-api-key: <key>
     # - can be a string or a macro
     apiKey: ${env.OPENROUTER_API_KEY}
+
+    # models: still supported alongside discovery - entries listed here are always present,
+    # bypass include/exclude, and are the only peer models that get a "bare" (unqualified)
+    # alias and can be targeted by selectors/profiles.
     models:
-      - meta-llama/llama-3.1-8b-instruct
-      - qwen/qwen3-235b-a22b-2507
-      - deepseek/deepseek-v3.2
       - z-ai/glm-4.7
-      - moonshotai/kimi-k2-0905
-      - minimax/minimax-m2.1
+
+    # discovery: automatically fetch this peer's model list instead of (or in addition to)
+    # listing every model under `models:` by hand
+    # - optional, default: not configured (models: is then required)
+    # - limited to servers that accept "Authorization: Bearer <apiKey>" auth (the same auth
+    #   this peer proxy already sends) and respond to an OpenAI-compatible /v1/models with
+    #   either {"object":"list","data":[...]} or the near-identical {"data":[...]} envelope
+    #   used by OpenRouter - this covers OpenAI, xAI, Mistral, DeepSeek, Cerebras, Together,
+    #   vLLM, LiteLLM, Ollama, and another llama-swap out of the box. Groq needs
+    #   `path: /openai/v1/models`; Google Gemini's OpenAI-compatible layer needs
+    #   `path: /v1beta/openai/models`. Anthropic and Gemini's own native API use a different
+    #   response shape and auth and are not supported by discovery.
+    discovery:
+      # enabled: turn discovery on or off
+      # - optional, default: true whenever the discovery block is present at all
+      enabled: true
+
+      # path: appended to `proxy` to form the discovery request URL
+      # - optional, default: "/v1/models"
+      path: /v1/models
+
+      # refreshInterval: how often, in seconds, to re-fetch the model list after startup
+      # - optional, default: 300
+      # - 0 means "only fetch at startup and on config reload"
+      refreshInterval: 300
+
+      # capabilities: import capability/modality/context-length info from the peer's
+      # response into this model's /v1/models entry
+      # - optional, default: true
+      capabilities: true
+
+      # include/exclude: glob patterns applied to discovered model IDs
+      # - optional, default: [] (include everything)
+      # - '*' matches '/' too, since model IDs are often "org/model"
+      # - exclude always wins over include
+      include: []
+      exclude:
+        - "*:free"
+        - "openai/*"
+
     # timeouts: configure proxy connection timeouts for this peer
     # - optional, defaults shown below
     # - useful when the peer runs on slower hardware
