@@ -1086,3 +1086,209 @@ func TestPeer_Shutdown_StopsDiscoveryPolling(t *testing.T) {
 		t.Fatalf("discovery kept polling after Shutdown: %d requests before, %d after", countAtShutdown, got)
 	}
 }
+
+// TestNewPeer_DiscoveryRetriesAfterFailedStartupFetchWithRefreshDisabled
+// proves design decision #3 of the retry follow-up: with RefreshInterval ==
+// 0 ("only at startup and config reload"), a failed startup fetch is no
+// longer a dead end - it is retried at RetryInterval until it succeeds.
+func TestNewPeer_DiscoveryRetriesAfterFailedStartupFetchWithRefreshDisabled(t *testing.T) {
+	var requestCount atomic.Int64
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requestCount.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Write([]byte(`{"object":"list","data":[{"id":"rescued-model"}]}`))
+	}))
+	defer testServer.Close()
+
+	proxyURL, _ := url.Parse(testServer.URL)
+	discovery := config.DefaultPeerDiscoveryConfig()
+	discovery.RefreshInterval = 0
+	discovery.RetryInterval = 1 // seconds
+
+	pr, err := NewPeer(config.Config{
+		PeerModels: config.NewPeerRegistry(),
+		Peers: config.PeerDictionaryConfig{
+			"peer1": {
+				Proxy:     testServer.URL,
+				ProxyURL:  proxyURL,
+				Discovery: &discovery,
+			},
+		},
+	}, testLogger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Shutdown(0)
+
+	require.Eventually(t, func() bool {
+		return pr.Handles("peer1/rescued-model")
+	}, 4*time.Second, 10*time.Millisecond, "a failed startup fetch should be retried until it succeeds")
+}
+
+// TestNewPeer_DiscoveryPollerStopsAfterRetrySucceedsWithRefreshDisabled
+// proves the second half of design decision #3: once a retried fetch
+// succeeds, the poller goroutine exits exactly as it would have on an
+// immediate success, since RefreshInterval == 0 means no periodic refresh.
+func TestNewPeer_DiscoveryPollerStopsAfterRetrySucceedsWithRefreshDisabled(t *testing.T) {
+	var requestCount atomic.Int64
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requestCount.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Write([]byte(`{"object":"list","data":[{"id":"rescued-model"}]}`))
+	}))
+	defer testServer.Close()
+
+	proxyURL, _ := url.Parse(testServer.URL)
+	discovery := config.DefaultPeerDiscoveryConfig()
+	discovery.RefreshInterval = 0
+	discovery.RetryInterval = 1 // seconds
+
+	pr, err := NewPeer(config.Config{
+		PeerModels: config.NewPeerRegistry(),
+		Peers: config.PeerDictionaryConfig{
+			"peer1": {
+				Proxy:     testServer.URL,
+				ProxyURL:  proxyURL,
+				Discovery: &discovery,
+			},
+		},
+	}, testLogger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Shutdown(0)
+
+	require.Eventually(t, func() bool {
+		return pr.Handles("peer1/rescued-model")
+	}, 4*time.Second, 10*time.Millisecond)
+
+	countAfterSuccess := requestCount.Load()
+	time.Sleep(1300 * time.Millisecond) // longer than the 1s retry interval
+	if got := requestCount.Load(); got != countAfterSuccess {
+		t.Fatalf("poller kept fetching after a successful retry with RefreshInterval 0: %d requests at success, %d after", countAfterSuccess, got)
+	}
+}
+
+// TestPeer_Shutdown_StopsDiscoveryRetryLoop guards against a goroutine leak
+// (and a blocked Shutdown) for a permanently failing peer with
+// RefreshInterval == 0: without retry, that poller would have exited after
+// its one failed fetch; with retry it keeps looping, so discoveryCtx must
+// still interrupt the wait between attempts.
+func TestPeer_Shutdown_StopsDiscoveryRetryLoop(t *testing.T) {
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer testServer.Close()
+
+	proxyURL, _ := url.Parse(testServer.URL)
+	discovery := config.DefaultPeerDiscoveryConfig()
+	discovery.RefreshInterval = 0
+	discovery.RetryInterval = 1 // seconds
+
+	pr, err := NewPeer(config.Config{
+		PeerModels: config.NewPeerRegistry(),
+		Peers: config.PeerDictionaryConfig{
+			"peer1": {
+				Proxy:     testServer.URL,
+				ProxyURL:  proxyURL,
+				Discovery: &discovery,
+			},
+		},
+	}, testLogger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		pr.Shutdown(0)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown did not return - discoveryCtx is not interrupting the retry wait")
+	}
+}
+
+// TestNewPeer_DiscoveryRetryDisabledKeepsSingleFetchWithRefreshDisabled locks
+// in the escape hatch (RetryInterval: 0) and the zero-value behavior that
+// protects hand-built PeerDiscoveryConfig literals elsewhere in the
+// codebase (e.g. internal/server/api_test.go): retry disabled plus
+// RefreshInterval 0 must still mean exactly one fetch, never more.
+func TestNewPeer_DiscoveryRetryDisabledKeepsSingleFetchWithRefreshDisabled(t *testing.T) {
+	var requestCount atomic.Int64
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer testServer.Close()
+
+	proxyURL, _ := url.Parse(testServer.URL)
+	discovery := config.DefaultPeerDiscoveryConfig()
+	discovery.RefreshInterval = 0
+	discovery.RetryInterval = 0
+
+	pr, err := NewPeer(config.Config{
+		PeerModels: config.NewPeerRegistry(),
+		Peers: config.PeerDictionaryConfig{
+			"peer1": {
+				Proxy:     testServer.URL,
+				ProxyURL:  proxyURL,
+				Discovery: &discovery,
+			},
+		},
+	}, testLogger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Shutdown(0)
+
+	time.Sleep(300 * time.Millisecond)
+	if got := requestCount.Load(); got != 1 {
+		t.Fatalf("expected exactly one fetch with retry disabled, got %d", got)
+	}
+}
+
+// TestNewPeer_DiscoveryRetryNeverExceedsRefreshInterval proves the clamp
+// behaviorally (not just in the nextDiscoveryDelay table test): a
+// RetryInterval larger than RefreshInterval must not slow retries down
+// below the ordinary refresh cadence.
+func TestNewPeer_DiscoveryRetryNeverExceedsRefreshInterval(t *testing.T) {
+	var requestCount atomic.Int64
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer testServer.Close()
+
+	proxyURL, _ := url.Parse(testServer.URL)
+	discovery := config.DefaultPeerDiscoveryConfig()
+	discovery.RefreshInterval = 1 // seconds
+	discovery.RetryInterval = 15  // seconds - much larger than refresh
+
+	pr, err := NewPeer(config.Config{
+		PeerModels: config.NewPeerRegistry(),
+		Peers: config.PeerDictionaryConfig{
+			"peer1": {
+				Proxy:     testServer.URL,
+				ProxyURL:  proxyURL,
+				Discovery: &discovery,
+			},
+		},
+	}, testLogger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Shutdown(0)
+
+	time.Sleep(2500 * time.Millisecond)
+	if got := requestCount.Load(); got < 3 {
+		t.Fatalf("expected retryInterval to be clamped to refreshInterval (>=3 requests in 2.5s at a 1s cadence), got %d", got)
+	}
+}

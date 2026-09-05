@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -27,6 +28,85 @@ import (
 // which would otherwise let a hanging /v1/models pin a discovery goroutine
 // indefinitely.
 const discoveryRequestTimeout = 30 * time.Second
+
+// maxDiscoveryRetryInterval caps discovery retry backoff when the peer has
+// no periodic refresh configured (RefreshInterval == 0), where there is no
+// user-provided ceiling to grow into. It deliberately matches the default
+// RefreshInterval (config.DefaultPeerDiscoveryConfig), so "no refresh
+// configured" backs off to the same ceiling as "default refresh configured".
+const maxDiscoveryRetryInterval = 5 * time.Minute
+
+// maxIntervalSeconds bounds the seconds-to-time.Duration conversion below so
+// it can never overflow int64 nanoseconds. Config validation
+// (config.PeerDiscoveryConfig.UnmarshalYAML) already rejects values this
+// large, but hand-built PeerDiscoveryConfig structs (tests, and any future
+// Go-side caller) bypass that validation, so this is a second, defensive
+// layer: an out-of-range value degrades to a very long but finite delay
+// instead of wrapping negative and causing a retry hot-spin.
+const maxIntervalSeconds = math.MaxInt64 / int64(time.Second)
+
+// intervalDuration converts a config seconds value to a time.Duration,
+// clamping to [0, maxIntervalSeconds] so the multiplication below cannot
+// overflow.
+func intervalDuration(seconds int) time.Duration {
+	switch {
+	case seconds <= 0:
+		return 0
+	case int64(seconds) > maxIntervalSeconds:
+		return time.Duration(maxIntervalSeconds) * time.Second
+	default:
+		return time.Duration(seconds) * time.Second
+	}
+}
+
+// nextDiscoveryDelay returns how long to wait before the next discovery
+// fetch for a peer, and whether to keep polling at all. consecutiveFailures
+// is 0 (or negative, treated the same as 0) immediately after a successful
+// fetch or before the first fetch.
+//
+// On success (or when retrySeconds is 0, disabling the shortened retry),
+// the delay is the ordinary refresh interval - or, if that is 0 ("only at
+// startup and config reload"), polling stops entirely.
+//
+// On failure, the delay starts at retrySeconds and doubles on each
+// consecutive failure, capped at the refresh interval (or, if the refresh
+// interval is 0, at maxDiscoveryRetryInterval - there is no user-provided
+// ceiling to grow into in that case). If retrySeconds is already larger
+// than that ceiling, it is clamped down to the ceiling immediately: a
+// config that sets retryInterval above refreshInterval gets the ordinary
+// refresh cadence rather than a validation error, since refreshInterval: 0
+// (no cross-field ceiling at all) is itself a legal value.
+func nextDiscoveryDelay(refreshSeconds, retrySeconds, consecutiveFailures int) (time.Duration, bool) {
+	refresh := intervalDuration(refreshSeconds)
+	retry := intervalDuration(retrySeconds)
+
+	if consecutiveFailures <= 0 || retry <= 0 {
+		if refresh <= 0 {
+			return 0, false
+		}
+		return refresh, true
+	}
+
+	ceiling := refresh
+	if ceiling <= 0 {
+		ceiling = maxDiscoveryRetryInterval
+	}
+
+	delay := retry
+	for i := 1; i < consecutiveFailures; i++ {
+		// Doubling only below half the ceiling keeps this loop bounded
+		// (at most ~63 iterations) and overflow-free for any
+		// consecutiveFailures, however large.
+		if delay > ceiling/2 {
+			return ceiling, true
+		}
+		delay *= 2
+	}
+	if delay > ceiling {
+		return ceiling, true
+	}
+	return delay, true
+}
 
 type peerMember struct {
 	peerID       string
@@ -262,28 +342,74 @@ func newPeerMember(peerID string, peer config.PeerConfig, logger *logmon.Monitor
 }
 
 // startDiscovery launches the background poller for one peer: an immediate
-// first fetch, then (when discovery.RefreshInterval > 0) a repeating fetch
-// on that interval until discoveryCtx is cancelled. RefreshInterval == 0
-// means "only at startup and config reload" - a single fetch, no ticker.
+// first fetch, then a repeating fetch until discoveryCtx is cancelled. The
+// delay before each subsequent fetch comes from nextDiscoveryDelay: on
+// success it is the ordinary RefreshInterval (or, if that is 0 - "only at
+// startup and config reload" - polling stops entirely); on failure it is a
+// short retry delay that doubles on each consecutive failure up to
+// RefreshInterval, so a transient failure (e.g. DNS not ready yet at
+// startup) recovers in seconds instead of waiting a full, possibly very
+// long, RefreshInterval. See nextDiscoveryDelay's doc comment for the exact
+// schedule, including the RefreshInterval == 0 case.
 func (r *Peer) startDiscovery(peerID string, discovery config.PeerDiscoveryConfig, member *peerMember) {
 	r.discoveryWG.Add(1)
 	go func() {
 		defer r.discoveryWG.Done()
 
-		r.refreshDiscovery(peerID, discovery, member)
-		if discovery.RefreshInterval <= 0 {
-			return
-		}
-
-		ticker := time.NewTicker(time.Duration(discovery.RefreshInterval) * time.Second)
-		defer ticker.Stop()
+		failures := 0
+		var prevFailureDelay time.Duration = -1
+		loggedCeiling := false
 
 		for {
+			err := r.refreshDiscovery(peerID, discovery, member)
+
+			// Shutdown may have cancelled discoveryCtx mid-fetch, in which
+			// case err is just context.Canceled - not a real discovery
+			// failure worth logging or scheduling a retry for. Check
+			// before touching any of the bookkeeping below.
+			if r.discoveryCtx.Err() != nil {
+				return
+			}
+
+			if err == nil {
+				if failures > 0 {
+					r.logger.Infof("peer %s: model discovery recovered after %d failed attempt(s)", peerID, failures)
+				}
+				failures = 0
+				prevFailureDelay = -1
+				loggedCeiling = false
+			} else {
+				failures++
+			}
+
+			delay, keepPolling := nextDiscoveryDelay(discovery.RefreshInterval, discovery.RetryInterval, failures)
+			if !keepPolling {
+				if err != nil {
+					r.logger.Warnf("peer %s: model discovery failed: %v", peerID, err)
+				}
+				return
+			}
+
+			if err != nil {
+				switch {
+				case delay != prevFailureDelay:
+					r.logger.Warnf("peer %s: model discovery failed (attempt %d): %v; retrying in %v", peerID, failures, err, delay)
+					loggedCeiling = false
+				case !loggedCeiling:
+					r.logger.Warnf("peer %s: model discovery still failing; will keep retrying every %v: %v", peerID, delay, err)
+					loggedCeiling = true
+				default:
+					r.logger.Debugf("peer %s: model discovery still failing (attempt %d): %v", peerID, failures, err)
+				}
+				prevFailureDelay = delay
+			}
+
+			timer := time.NewTimer(delay)
 			select {
 			case <-r.discoveryCtx.Done():
+				timer.Stop()
 				return
-			case <-ticker.C:
-				r.refreshDiscovery(peerID, discovery, member)
+			case <-timer.C:
 			}
 		}
 	}()
@@ -291,19 +417,21 @@ func (r *Peer) startDiscovery(peerID string, discovery config.PeerDiscoveryConfi
 
 // refreshDiscovery performs one discovery fetch for a peer. On success, it
 // filters out any discovered model ID that collides with a reserved name,
-// publishes the result to the shared registry, and republishes the full
-// merged route table. On failure, it logs a warning and leaves the
-// registry (and therefore the route table) untouched, per the "log and
+// publishes the result to the shared registry, republishes the full merged
+// route table, and returns nil. On failure, it returns the error without
+// modifying the registry (and therefore the route table), per the "log and
 // keep the previous known-good set" policy - an unreachable peer must not
-// make its previously discovered models stop working.
-func (r *Peer) refreshDiscovery(peerID string, discovery config.PeerDiscoveryConfig, member *peerMember) {
+// make its previously discovered models stop working. Logging the failure
+// itself is the caller's responsibility: only the poller loop in
+// startDiscovery knows the attempt number, the next retry delay, and
+// whether a shutdown is already in progress.
+func (r *Peer) refreshDiscovery(peerID string, discovery config.PeerDiscoveryConfig, member *peerMember) error {
 	ctx, cancel := context.WithTimeout(r.discoveryCtx, discoveryRequestTimeout)
 	defer cancel()
 
 	discovered, err := FetchDiscoveredModels(ctx, member.httpClient, peerID, member.baseURL, discovery, member.apiKey)
 	if err != nil {
-		r.logger.Warnf("peer %s: model discovery failed: %v", peerID, err)
-		return
+		return err
 	}
 
 	kept := make(map[string]config.DiscoveredModel, len(discovered))
@@ -321,6 +449,7 @@ func (r *Peer) refreshDiscovery(peerID string, discovery config.PeerDiscoveryCon
 
 	r.publishRoutes()
 	event.Emit(swaputil.PeerModelsChangedEvent{PeerID: peerID})
+	return nil
 }
 
 // publishRoutes rebuilds the full route table from the immutable static

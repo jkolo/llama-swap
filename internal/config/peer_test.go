@@ -112,6 +112,61 @@ models:
 			wantErr: "discovery.refreshInterval",
 		},
 		{
+			name: "discovery with refreshInterval above the maximum",
+			yaml: `
+proxy: http://localhost:8080
+discovery:
+  refreshInterval: 10000000000
+models:
+  - model_a
+`,
+			wantErr: "discovery.refreshInterval",
+		},
+		{
+			name: "discovery with refreshInterval at the maximum",
+			yaml: `
+proxy: http://localhost:8080
+discovery:
+  refreshInterval: 315360000
+models:
+  - model_a
+`,
+			wantErr: "",
+		},
+		{
+			name: "discovery with negative retryInterval",
+			yaml: `
+proxy: http://localhost:8080
+discovery:
+  retryInterval: -1
+models:
+  - model_a
+`,
+			wantErr: "discovery.retryInterval",
+		},
+		{
+			name: "discovery with retryInterval above the maximum",
+			yaml: `
+proxy: http://localhost:8080
+discovery:
+  retryInterval: 10000000000
+models:
+  - model_a
+`,
+			wantErr: "discovery.retryInterval",
+		},
+		{
+			name: "discovery with retryInterval of zero disables retry",
+			yaml: `
+proxy: http://localhost:8080
+discovery:
+  retryInterval: 0
+models:
+  - model_a
+`,
+			wantErr: "",
+		},
+		{
 			name: "discovery with empty path",
 			yaml: `
 proxy: http://localhost:8080
@@ -165,6 +220,9 @@ discovery: {}
 	if cfg.Discovery.RefreshInterval != 300 {
 		t.Errorf("expected default refreshInterval 300, got %d", cfg.Discovery.RefreshInterval)
 	}
+	if cfg.Discovery.RetryInterval != 15 {
+		t.Errorf("expected default retryInterval 15, got %d", cfg.Discovery.RetryInterval)
+	}
 	if !cfg.Discovery.Capabilities {
 		t.Error("expected Capabilities to default to true")
 	}
@@ -217,6 +275,7 @@ discovery:
   enabled: false
   path: /openai/v1/models
   refreshInterval: 60
+  retryInterval: 5
   capabilities: false
 models:
   - model_a
@@ -232,6 +291,9 @@ models:
 	}
 	if cfg.Discovery.RefreshInterval != 60 {
 		t.Errorf("expected explicit refreshInterval 60, got %d", cfg.Discovery.RefreshInterval)
+	}
+	if cfg.Discovery.RetryInterval != 5 {
+		t.Errorf("expected explicit retryInterval 5, got %d", cfg.Discovery.RetryInterval)
 	}
 	if cfg.Discovery.Capabilities {
 		t.Error("expected Capabilities to be false when explicitly set")

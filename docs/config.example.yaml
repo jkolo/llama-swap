@@ -769,6 +769,14 @@ peers:
       # - 0 means "only fetch at startup and on config reload"
       refreshInterval: 300
 
+      # retryInterval: first delay, in seconds, before re-fetching after a failed
+      # discovery attempt (e.g. the peer was briefly unreachable)
+      # - optional, default: 15
+      # - doubles on each consecutive failure until it reaches refreshInterval, then
+      #   holds there; a successful fetch resets it
+      # - 0 disables the shortened retry, falling back to refreshInterval
+      retryInterval: 15
+
       # capabilities: import capability/modality/context-length info from the peer's
       # response into this model's /v1/models entry
       # - optional, default: true

@@ -751,8 +751,16 @@
                             "refreshInterval": {
                                 "type": "integer",
                                 "minimum": 0,
+                                "maximum": 315360000,
                                 "default": 300,
                                 "description": "How often, in seconds, to re-fetch the model list after startup. 0 means only fetch at startup and on config reload."
+                            },
+                            "retryInterval": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 315360000,
+                                "default": 15,
+                                "description": "First delay, in seconds, before re-fetching after a failed discovery attempt. Doubles on each consecutive failure until it reaches refreshInterval, then holds there; a successful fetch resets it. 0 disables the shortened retry, falling back to the ordinary refreshInterval."
                             },
                             "capabilities": {
                                 "type": "boolean",

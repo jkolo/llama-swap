@@ -55,6 +55,16 @@ type PeerDiscoveryConfig struct {
 	// config reload".
 	RefreshInterval int `yaml:"refreshInterval"`
 
+	// RetryInterval is the first delay, in seconds, before re-fetching after
+	// a failed discovery attempt. It doubles on each consecutive failure
+	// until it reaches RefreshInterval, then holds there; a successful
+	// fetch resets it. 0 disables the shortened retry, so a failure waits
+	// the ordinary RefreshInterval instead. Note this default only applies
+	// to YAML-loaded configs: a hand-built PeerDiscoveryConfig{} literal
+	// (as used by some tests and any future Go-side caller) gets the zero
+	// value, i.e. retry disabled - see DefaultPeerDiscoveryConfig.
+	RetryInterval int `yaml:"retryInterval"`
+
 	// Capabilities controls whether capability/modality/context-length
 	// fields from the peer's response are imported into ModelCapConfig.
 	Capabilities bool `yaml:"capabilities"`
@@ -79,11 +89,19 @@ func DefaultPeerDiscoveryConfig() PeerDiscoveryConfig {
 		Enabled:         true,
 		Path:            "/v1/models",
 		RefreshInterval: 300,
+		RetryInterval:   15,
 		Capabilities:    true,
 		Include:         []string{},
 		Exclude:         []string{},
 	}
 }
+
+// maxDiscoveryIntervalSeconds bounds RefreshInterval and RetryInterval so
+// the router's seconds-to-time.Duration conversion (RefreshInterval *
+// time.Second) can never overflow int64 nanoseconds. 315360000s is 10
+// years - far beyond any legitimate polling interval, but small enough
+// that the conversion stays well inside int64 range.
+const maxDiscoveryIntervalSeconds = 315360000
 
 // UnmarshalYAML applies discovery defaults and compiles include/exclude
 // glob patterns. Called only when the discovery block is present, so a
@@ -100,8 +118,11 @@ func (d *PeerDiscoveryConfig) UnmarshalYAML(unmarshal func(interface{}) error) e
 	if strings.TrimSpace(defaults.Path) == "" {
 		return fmt.Errorf("discovery.path cannot be empty")
 	}
-	if defaults.RefreshInterval < 0 {
-		return fmt.Errorf("discovery.refreshInterval must be >= 0")
+	if defaults.RefreshInterval < 0 || defaults.RefreshInterval > maxDiscoveryIntervalSeconds {
+		return fmt.Errorf("discovery.refreshInterval must be between 0 and %d", maxDiscoveryIntervalSeconds)
+	}
+	if defaults.RetryInterval < 0 || defaults.RetryInterval > maxDiscoveryIntervalSeconds {
+		return fmt.Errorf("discovery.retryInterval must be between 0 and %d", maxDiscoveryIntervalSeconds)
 	}
 
 	includeRe, err := CompileGlobs(defaults.Include)
