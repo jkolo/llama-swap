@@ -202,7 +202,6 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		return nil, fmt.Errorf("store is required")
 	}
 
-
 	var local router.LocalRouter
 	var err error
 
@@ -251,6 +250,10 @@ func New(cfg config.Config, muxlog *logmon.Monitor, proxylog *logmon.Monitor, up
 		config.NewConfigProvider(cfg),
 	)
 	if err != nil {
+		// router.NewPeer above may have started background discovery
+		// goroutines (see peers.<id>.discovery); this is the last fallible
+		// step in New, so it must clean them up rather than leaking them.
+		peer.Shutdown(0)
 		return nil, fmt.Errorf("building the MCP tool registry: %w", err)
 	}
 	s.tools = tools
